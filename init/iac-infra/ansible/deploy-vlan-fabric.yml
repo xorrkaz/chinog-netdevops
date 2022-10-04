@@ -1,0 +1,124 @@
+---
+- name: Deploy VLAN Fabric to distribution and access
+  hosts: distribution,access
+  gather_facts: false
+  connection: network_cli
+  tasks:
+    - name: Deploy L2 VLANs
+      ios_vlans:
+        config: "{{ fabric.vlans.l2 }}"
+        state: overridden
+
+    - name: Adjust spanning tree for VLANs
+      ios_config:
+        lines:
+          - spanning-tree vlan {{ item.vlan_id|string }} priority 0
+      with_items: "{{ fabric.vlans.l2 }}"
+      when: '"distribution" in group_names'
+
+    - name: Configure distribution trunk port
+      ios_l2_interfaces:
+        config:
+          - name: "{{ item.port }}"
+            trunk:
+              allowed_vlans: "{{ item.allowed_vlans }}"
+              encapsulation: dot1q
+        state: replaced
+      with_items: "{{ fabric.trunk_ports.distribution }}"
+      when: '"distribution" in group_names'
+
+    - name: Configure access trunk port
+      ios_l2_interfaces:
+        config:
+          - name: "{{ item.port }}"
+            trunk:
+              allowed_vlans: "{{ item.allowed_vlans }}"
+              encapsulation: dot1q
+        state: replaced
+      with_items: "{{ fabric.trunk_ports.access }}"
+      when: '"access" in group_names'
+
+- name: Deploy access port configuration
+  hosts: access
+  gather_facts: false
+  connection: network_cli
+  tasks:
+    - name: Configure VLAN on access ports
+      ios_l2_interfaces:
+        config:
+          - name: "{{ item.port }}"
+            access:
+              vlan: "{{ item.access_vlan }}"
+        state: replaced
+      with_items: "{{ fabric.access_ports[inventory_hostname] }}"
+      when: "inventory_hostname in fabric.access_ports"
+
+    - name: Enable portfast on access ports
+      ios_config:
+        lines:
+          - spanning-tree portfast
+        parents: interface {{ item. port }}
+      with_items: "{{ fabric.access_ports[inventory_hostname] }}"
+      when: "inventory_hostname in fabric.access_ports"
+
+- name: Deploy L3 VLAN config to distribution
+  hosts: distribution
+  gather_facts: false
+  connection: network_cli
+  tasks:
+    - name: Create SVI interface
+      ios_interfaces:
+        config:
+          - name: Vlan{{ item.vlan }}
+            enabled: true
+        state: replaced
+      with_items: "{{ fabric.vlans.l3 }}"
+
+    - name: Set SVI L3 config
+      ios_l3_interfaces:
+        config:
+          - name: Vlan{{ item.vlan }}
+            ipv4:
+              - address: "{{ item.svi_address | replace('X', dist_octet|string) }}/{{ item.subnet.split('/')[1] }}"
+        state: replaced
+      with_items: "{{ fabric.vlans.l3 }}"
+
+    - name: Enable OSPF on SVI
+      ios_config:
+        lines:
+          - ip ospf 1 area 0
+        parents: interface Vlan{{ item.vlan }}
+      with_items: "{{ fabric.vlans.l3 }}"
+
+    - name: Create DHCP server if needed
+      ios_config:
+        lines:
+          - import all
+          - network {{ item.subnet.split('/')[0] | replace('X', dist_octet|string) }} /{{ item.subnet.split('/')[1] }}
+          - dns-server {{ fabric.dns | join(' ') }}
+          - default-router {{ item.svi_address | replace('X', dist_octet|string) }}
+        parents: ip dhcp pool VLAN_{{ item.vlan }}
+      with_items: "{{ fabric.vlans.l3 }}"
+      when: item.dhcp
+
+    - name: Exclude addresses from DHCP
+      ios_config:
+        lines:
+          - ip dhcp excluded-address {{ item.1.start | replace('X', dist_octet|string) }} {{ item.1.end | replace('X', dist_octet|string) }}
+      loop: "{{ fabric.vlans.l3|subelements('dhcp_exclude') }}"
+      loop_control:
+        label: "{{ item.0.vlan }}"
+      when: item.0.dhcp
+
+- name: Adjust NAT configuration
+  hosts: rtr-edge
+  gather_facts: false
+  connection: network_cli
+  tasks:
+    - name: Allow VLAN subnets
+      ios_config:
+        lines:
+          - access-list 10 permit {{ item[1].subnet.split('/')[0] | replace('X', (item[0] + 1)|string) }} 0.0.0.{{ (2 ** (32 - item[1].subnet.split('/')[1]|int) - 1)|string }}
+      with_nested:
+        - "{{ range(groups['distribution'] | length)|list }}"
+        - "{{ fabric.vlans.l3 }}"

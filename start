@@ -1,0 +1,22 @@
+#!/bin/bash
+
+set -e
+
+cd `dirname $0`
+BASEDIR=`pwd`
+LAB="$BASEDIR"
+LABDIR="$HOME/cml-iac"
+
+init_common() {
+	for f in `ls $BASEDIR/common/init-*.sh | sort`; do
+		. $f
+	done
+}
+
+if [ -e "$LAB/init.sh" ]; then
+	. $LAB/init.sh
+	echo
+	echo "Lab is ready to go!"
+else
+	exit 2
+fi
